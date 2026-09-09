@@ -4,7 +4,7 @@ Updated on Wed Sep 09 11:19:57 2026
 
 @author: elise langagne
 
-File        : gloria_app.py
+File        : GLORIA_app.py
 Author      : Elise Langagne (elise.langagne@sorbonne-universite.fr)
 Version     : 1.10.0
 Date        : 2026-09-09
