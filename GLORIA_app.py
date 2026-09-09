@@ -3,8 +3,17 @@
 Updated on Wed Sep 09 11:19:57 2026
 
 @author: elise langagne
-"""
 
+File        : gloria_app.py
+Author      : Elise Langagne (elise.langagne@sorbonne-universite.fr)
+Version     : 1.10.0
+Date        : 2026-09-09
+Copyright   : ©2024 CNRS, Sorbonne Université — IMPMC (UMR 7590)
+              Software "GLORIA" — CeCILL Free Software License Agreement v2.1
+SPDX-License-Identifier: CECILL-2.1
+Brief       : Desktop application for the provenance and dating of medieval
+              stained glass from compositional data.
+"""
 
 # Build .exe:
 #   pyinstaller --noconfirm --onefile --windowed --name GLORIA gloria.py
