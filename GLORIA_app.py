@@ -2,7 +2,7 @@
 """
 Created on Fri Jun 19 11:19:57 2026
 
-@author: elise
+@author: elise langagne
 """
 
 
@@ -34,6 +34,8 @@ from sklearn.calibration import CalibratedClassifierCV
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
 
+from imblearn.pipeline import Pipeline as ImbPipeline
+
 pd.set_option("future.no_silent_downcasting", True)
 
 APP_NAME = "GLORIA"
@@ -63,20 +65,21 @@ CONFIG = {
     "smote_min_samples": 10,
     "rf_base_params": {
         "class_weight": "balanced",
-        "n_jobs": 1
+        "n_jobs": -1,
     },
+
     "rf_param_dist": {
-        "n_estimators": np.arange(300, 501, 50),
-        "max_depth": [30, 40, 50],
-        "min_samples_split": np.arange(2, 11),
-        "min_samples_leaf": [1],
-        "max_features": ["sqrt", "log2", None],
-        "bootstrap": [True, False]
+        "clf__n_estimators": np.arange(300, 801, 100),
+        "clf__max_depth": [None, 10, 20, 30, 40, 50],
+        "clf__min_samples_split": [2, 3, 4, 5, 8, 10],
+        "clf__min_samples_leaf": [1, 2, 3, 4],
+        "clf__max_features": ["sqrt", "log2", None],
+        "clf__bootstrap": [True, False],
     },
     "calibration": {
         "method": "sigmoid",
-        "cv": 5
-    }
+        "cv": 5,
+    },
 }
 
 
@@ -132,40 +135,37 @@ def build_model_path(database_hash: str, target: str) -> str:
     model_dir.mkdir(parents=True, exist_ok=True)
     return str(model_dir / f"{target_safe}_model.joblib")
 
-def apply_smote_with_min_class_threshold(
-    X_train,
-    y_train,
-    min_samples: int,
-    random_state: int
-    ):
+class ThresholdSMOTE(SMOTE):
+    """SMOTE restricted to minority classes of at least `min_class_size`.
 
+    The sampling strategy is recomputed at every fit_resample call, using the
+    class counts of the data actually passed in. Inside a pipeline handed to a
+    CV loop, that data is the training partition of the current fold, so no
+    synthetic point is ever built from a validation sample.
+    """
 
-    classes, counts = np.unique(y_train, return_counts=True)
-    max_count = counts.max()
+    def __init__(self, min_class_size: int = 10, k_neighbors: int = 5,
+                 random_state: int | None = None):
+        super().__init__(random_state=random_state, k_neighbors=k_neighbors)
+        self.min_class_size = min_class_size
 
-    sampling_strategy = {}
+    def fit_resample(self, X, y):
+        counts = pd.Series(np.asarray(y)).value_counts()
+        majority = int(counts.max())
 
-    for cls, count in zip(classes, counts):
-        if count < max_count and count >= min_samples:
-            sampling_strategy[cls] = max_count
+        strategy = {
+            cls: majority
+            for cls, n in counts.items()
+            if n >= self.min_class_size and n < majority
+        }
+        if not strategy:
+            return X, y
 
-    if len(sampling_strategy) == 0:
-        print("SMOTE skipped: no class meets the minimum threshold.")
-        return X_train, y_train
+        smallest = int(min(counts[cls] for cls in strategy))
+        self.sampling_strategy = strategy
+        self.k_neighbors = int(min(5, max(1, smallest - 1)))
+        return super().fit_resample(X, y)
 
-    # k_neighbors must be smaller than the smallest oversampled class size
-    smallest_resampled_class = min(
-        counts[np.isin(classes, list(sampling_strategy.keys()))]
-    )
-    k_neighbors = min(5, smallest_resampled_class - 1)
-
-    smote = SMOTE(
-        sampling_strategy=sampling_strategy,
-        k_neighbors=k_neighbors,
-        random_state=random_state
-    )
-
-    return smote.fit_resample(X_train, y_train)
 
 def train_model_for_target(
     X: pd.DataFrame,
@@ -175,91 +175,113 @@ def train_model_for_target(
     optimize_hyperparams: bool,
     resample_method: str | None,
     n_iter_search: int,
-    config: dict
+    config: dict,
 ):
-    print(f"Training model for {target_name}")
+    """Train one calibrated classifier for one target, without any leakage.
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    Returns a bundle whose "model" is a calibrated pipeline. Scaling and
+    resampling live inside that pipeline, so the bundle no longer carries a
+    separate "scaler" entry.
+    """
+    print(f"Training model for {target_name}")
 
     label_encoder = LabelEncoder()
     y_encoded = label_encoder.fit_transform(y.astype(str))
 
-    class_counts = np.bincount(y_encoded)
-    min_samples = class_counts.min()
-
-    X_train, y_train = X_scaled.copy(), y_encoded.copy()
+    # --- pipeline: scaling -> resampling -> classifier -----------------------
+    steps = [("scaler", StandardScaler())]
 
     if resample_method == "smote":
-        X_train, y_train = apply_smote_with_min_class_threshold(
-        X_train=X_train,
-        y_train=y_train,
-        min_samples=config["smote_min_samples"],
-        random_state=config["random_state"]
-    )
+        steps.append(("smote", ThresholdSMOTE(
+            min_class_size=config["smote_min_samples"],
+            k_neighbors=5,
+            random_state=config["random_state"],
+        )))
     elif resample_method == "undersample":
-        rus = RandomUnderSampler(random_state=config["random_state"])
-        X_train, y_train = rus.fit_resample(X_train, y_train)
+        from imblearn.under_sampling import RandomUnderSampler
+        steps.append(("undersample", RandomUnderSampler(
+            random_state=config["random_state"])))
 
-    rf = RandomForestClassifier(
+    steps.append(("clf", RandomForestClassifier(
         random_state=config["random_state"],
-        **config["rf_base_params"]
-    )
+        **config["rf_base_params"],
+    )))
 
-    cv = StratifiedKFold(
-        n_splits=config["cv_folds"],
-        shuffle=True,
-        random_state=config["random_state"]
-    )
+    pipeline = ImbPipeline(steps)
 
+    # --- hyperparameter search on the RAW data ------------------------------
+    # The pipeline is what the CV loop receives, so the scaler and the
+    # resampler are refitted inside every training fold.
     if optimize_hyperparams:
+        cv = StratifiedKFold(
+            n_splits=config["cv_folds"],
+            shuffle=True,
+            random_state=config["random_state"],
+        )
         search = RandomizedSearchCV(
-            rf,
+            pipeline,
             param_distributions=config["rf_param_dist"],
             n_iter=n_iter_search,
             cv=cv,
             scoring=config["scoring"],
             random_state=config["random_state"],
-            n_jobs=-1
+            n_jobs=-1,
+            refit=True,
         )
-        search.fit(X_train, y_train)
-        rf = search.best_estimator_
+        search.fit(X, y_encoded)
+        pipeline = search.best_estimator_
         print(f"Best CV {config['scoring']}: {search.best_score_:.3f}")
+    else:
+        pipeline.fit(X, y_encoded)
 
-    rf.fit(X_train, y_train)
-
-    calibrated_rf = CalibratedClassifierCV(
-        rf,
+    # --- probability calibration on the RAW data ----------------------------
+    # CalibratedClassifierCV refits the whole pipeline on each calibration
+    # training split and fits the sigmoid on the held-out split, which still
+    # carries the natural class prior. Calibrating on a SMOTE-balanced array
+    # would return probabilities relative to a uniform prior.
+    calibrated = CalibratedClassifierCV(
+        pipeline,
         method=config["calibration"]["method"],
-        cv=config["calibration"]["cv"]
+        cv=config["calibration"]["cv"],
     )
-    calibrated_rf.fit(X_train, y_train)
+    calibrated.fit(X, y_encoded)
 
-    print("Probabilities calibrated")
+    print("Probabilities calibrated on the non-resampled distribution")
 
     return {
-        "model": calibrated_rf,
-        "scaler": scaler,
+        "model": calibrated,
         "label_encoder": label_encoder,
-        "features": common_columns
+        "features": common_columns,
+        "resample_method": resample_method,
+        "bundle_version": 2,          
     }
 
 
 def predict_with_bundle(bundle, X_unknown):
+    """Predict labels and confidence scores.
+
+    Scaling now happens inside the pipeline, so there is no separate scaler
+    to apply here.
+    """
+    if bundle.get("bundle_version", 1) < 2:
+        raise ValueError(
+            "This model bundle was produced by GLORIA <= 1.10 and is not "
+            "compatible with the current pipeline. Delete the cached bundles "
+            "and retrain."
+        )
+
     model = bundle["model"]
-    scaler = bundle["scaler"]
     label_encoder = bundle["label_encoder"]
     features = bundle["features"]
 
-    X_scaled = scaler.transform(X_unknown[features])
-
-    proba = model.predict_proba(X_scaled)
+    proba = model.predict_proba(X_unknown[features])
     pred_idx = np.argmax(proba, axis=1)
 
     return (
         label_encoder.inverse_transform(pred_idx),
-        np.max(proba, axis=1).round(2)
+        np.max(proba, axis=1).round(2),
     )
+
 
 
 def GLORIA_v10_gui(
